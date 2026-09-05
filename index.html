@@ -59,7 +59,7 @@
   let driving = false, conv = null, connecting = false, wakeLock = null;
   let audioCtx = null, analyser = null, micStream = null, rafId = null;
   let noiseFloor = 0.01, aboveSince = 0, lastSpeechAt = 0, silenceTimer = null;
-  let transcript = [], connectedMs = 0, connectedAt = 0, briefingDone = false;
+  let transcript = [], connectedMs = 0, connectedAt = 0, briefingDone = false, lastDispatchAt = 0, clockTimer = null;
 
   // ---------- persistence for the day (transcript + briefing flag) ----------
   const today = new Date().toISOString().slice(0, 10);
@@ -138,9 +138,19 @@
           if (!text) return;
           transcript.push({ role, text, t: Date.now() });
           if (role === "agent" && !briefingDone && transcript.length > 1) briefingDone = true;
+          if (role === "agent" && /on its way|dispatched|sent it|sending it/i.test(text)) lastDispatchAt = Date.now();
           armSilenceTimer(); persist();
         },
       });
+      // a clock for the agent: a background note every minute (does not interrupt, costs no turn)
+      clearInterval(clockTimer);
+      clockTimer = setInterval(() => {
+        if (!conv) return;
+        const since = lastDispatchAt ? Math.round((Date.now() - lastDispatchAt) / 60000) : null;
+        const note = "Time note: it is " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) +
+          (since !== null ? ". Minutes since the last dispatch: " + since + "." : ". No dispatch yet this call.");
+        try { conv.sendContextualUpdate(note); } catch (e) {}
+      }, 60000);
     } catch (e) {
       connecting = false; conv = null;
       err.textContent = "Could not connect: " + (e?.message || e);
@@ -152,7 +162,7 @@
     silenceTimer = setTimeout(async () => { if (conv) { try { await conv.endSession(); } catch (e) {} } }, SILENCE_HANGUP_MS);
   }
   function afterCall() {
-    clearTimeout(silenceTimer);
+    clearTimeout(silenceTimer); clearInterval(clockTimer);
     if (connectedAt) { connectedMs += Date.now() - connectedAt; connectedAt = 0; }
     conv = null; connecting = false; persist(); showMinutes();
     if (driving) { big.className = "armed"; big.textContent = "Listening"; status.textContent = "Off call. Speak to reconnect."; noiseFloor = Math.max(noiseFloor, 0.01); aboveSince = 0; }
