@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Research">
+<meta name="theme-color" content="#141813">
+<link rel="manifest" href="manifest.webmanifest">
+<title>Research colleague</title>
+<style>
+  :root { --bg:#141813; --ink:#E7EAE0; --muted:#A3AB9B; --olive:#97BF62; --teal:#63B7D2; --ochre:#DDAA4E; --risk:#E07A5F; }
+  * { box-sizing:border-box; }
+  html, body { height:100%; margin:0; background:var(--bg); color:var(--ink); font-family:-apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { display:flex; flex-direction:column; align-items:center; justify-content:center; padding:24px; gap:26px; user-select:none; -webkit-user-select:none; }
+  h1 { font-size:18px; font-weight:600; margin:0; color:var(--muted); letter-spacing:0.02em; }
+  #big { width:min(72vw,340px); height:min(72vw,340px); border-radius:50%; border:none; font-size:30px; font-weight:700; color:#141813; background:var(--olive); -webkit-tap-highlight-color:transparent; transition:background .25s, transform .15s; }
+  #big.armed { background:var(--ochre); animation:breathe 3s infinite; }
+  #big.connecting { background:var(--teal); opacity:.7; }
+  #big.listening { background:var(--olive); animation:pulse 2s infinite; }
+  #big.speaking { background:var(--teal); animation:pulse 1.2s infinite; }
+  #big:disabled { opacity:.5; }
+  @keyframes pulse { 0% { box-shadow:0 0 0 0 rgba(99,183,210,.45);} 70% { box-shadow:0 0 0 30px rgba(99,183,210,0);} 100% { box-shadow:0 0 0 0 rgba(99,183,210,0);} }
+  @keyframes breathe { 0%,100% { transform:scale(1);} 50% { transform:scale(1.03);} }
+  #status { font-size:20px; text-align:center; min-height:1.4em; }
+  #sub { font-size:14px; color:var(--muted); text-align:center; max-width:34ch; min-height:2.8em; }
+  #meter { width:min(72vw,340px); height:6px; background:#2A3227; border-radius:3px; overflow:hidden; }
+  #meter > div { height:100%; width:0; background:var(--olive); transition:width .1s; }
+  #row { display:flex; gap:14px; }
+  .small { padding:14px 22px; border-radius:14px; border:1px solid #2F3A2C; background:#1D231B; color:var(--ink); font-size:17px; }
+  .small.danger { border-color:var(--risk); color:var(--risk); }
+  #err { color:var(--risk); font-size:14px; text-align:center; max-width:36ch; }
+  #minutes { font-variant-numeric:tabular-nums; color:var(--muted); font-size:14px; }
+</style>
+</head>
+<body>
+  <h1>Research colleague</h1>
+  <button id="big">Start drive</button>
+  <div id="status">Tap once before you pull out</div>
+  <div id="sub">Then just talk. Say "hey", wait for "I'm here", and go on. It hangs up after 45 seconds of quiet and reconnects when you speak.</div>
+  <div id="meter"><div id="level"></div></div>
+  <div id="minutes"></div>
+  <div id="row"><button class="small danger" id="end" hidden>End drive</button></div>
+  <div id="err"></div>
+
+<script type="module">
+  import { Conversation } from "https://cdn.jsdelivr.net/npm/@elevenlabs/client@1.24.0/+esm";
+
+  const AGENT_ID = "agent_2001m1smpwqnezr892jht4ezm88r";   // the setup script fills this in
+  const SILENCE_HANGUP_MS = 45000;             // matches the agent's silence_end_call_timeout
+  const TRIGGER_RATIO = 3.2;                   // speech must exceed the noise floor by this factor
+  const TRIGGER_HOLD_MS = 350;                 // ... for this long, to ignore bumps and clicks
+  const CONTEXT_CHARS = 1800;                  // how much of the recent transcript we hand back on reconnect
+
+  const $ = id => document.getElementById(id);
+  const big = $("big"), status = $("status"), sub = $("sub"), err = $("err"), level = $("level"), endBtn = $("end"), minutesEl = $("minutes");
+
+  let driving = false, conv = null, connecting = false, wakeLock = null;
+  let audioCtx = null, analyser = null, micStream = null, rafId = null;
+  let noiseFloor = 0.01, aboveSince = 0, lastSpeechAt = 0, silenceTimer = null;
+  let transcript = [], connectedMs = 0, connectedAt = 0, briefingDone = false;
+
+  // ---------- persistence for the day (transcript + briefing flag) ----------
+  const today = new Date().toISOString().slice(0, 10);
+  try {
+    const saved = JSON.parse(localStorage.getItem("commute-" + today) || "null");
+    if (saved) { transcript = saved.transcript || []; briefingDone = !!saved.briefingDone; connectedMs = saved.connectedMs || 0; }
+  } catch (e) {}
+  function persist() {
+    try { localStorage.setItem("commute-" + today, JSON.stringify({ transcript: transcript.slice(-80), briefingDone, connectedMs })); } catch (e) {}
+  }
+  function recentContext() {
+    const lines = transcript.map(t => (t.role === "user" ? "Moshe: " : "You: ") + t.text);
+    let out = lines.join("\n");
+    if (out.length > CONTEXT_CHARS) out = out.slice(-CONTEXT_CHARS);
+    return out || "(nothing yet this drive)";
+  }
+  function showMinutes() {
+    const total = connectedMs + (connectedAt ? Date.now() - connectedAt : 0);
+    minutesEl.textContent = "Call minutes used this drive: " + (total / 60000).toFixed(1);
+  }
+  setInterval(showMinutes, 5000);
+
+  // ---------- wake lock ----------
+  async function keepAwake() { try { if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {} }
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && driving) keepAwake(); });
+
+  // ---------- local voice detection (no minutes) ----------
+  async function startLocalListening() {
+    if (!micStream) micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === "suspended") await audioCtx.resume();
+    if (!analyser) {
+      const src = audioCtx.createMediaStreamSource(micStream);
+      analyser = audioCtx.createAnalyser(); analyser.fftSize = 1024; src.connect(analyser);
+    }
+    const buf = new Float32Array(analyser.fftSize);
+    const tick = () => {
+      if (!driving) return;
+      analyser.getFloatTimeDomainData(buf);
+      let sum = 0; for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+      const rms = Math.sqrt(sum / buf.length);
+      // adaptive noise floor: falls quickly, rises slowly, so road noise is learned and speech stands out
+      noiseFloor = rms < noiseFloor ? noiseFloor * 0.98 + rms * 0.02 : noiseFloor * 0.999 + rms * 0.001;
+      const ratio = rms / Math.max(noiseFloor, 0.002);
+      level.style.width = Math.min(100, ratio * 20) + "%";
+      if (!conv && !connecting) {
+        const now = performance.now();
+        if (ratio > TRIGGER_RATIO) { if (!aboveSince) aboveSince = now; if (now - aboveSince > TRIGGER_HOLD_MS) { aboveSince = 0; connect(); } }
+        else aboveSince = 0;
+      }
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+  }
+
+  // ---------- the call ----------
+  async function connect() {
+    if (conv || connecting || !driving) return;
+    connecting = true; err.textContent = "";
+    big.className = "connecting"; big.textContent = "…"; status.textContent = "Connecting";
+    try {
+      conv = await Conversation.startSession({
+        agentId: AGENT_ID,
+        dynamicVariables: { recent_context: recentContext(), briefing_done: briefingDone ? "yes" : "no", local_time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) },
+        onConnect: () => { connecting = false; connectedAt = Date.now(); big.className = "listening"; big.textContent = "On call"; status.textContent = "Connected"; armSilenceTimer(); },
+        onDisconnect: () => { afterCall(); },
+        onError: (e) => { err.textContent = String(e?.message || e); },
+        onModeChange: ({ mode }) => {
+          big.className = mode === "speaking" ? "speaking" : "listening";
+          status.textContent = mode === "speaking" ? "Speaking" : "Listening";
+          if (mode === "speaking") armSilenceTimer();
+        },
+        onMessage: (m) => {
+          const role = (m.source === "user" || m.role === "user") ? "user" : "agent";
+          const text = m.message || m.text || "";
+          if (!text) return;
+          transcript.push({ role, text, t: Date.now() });
+          if (role === "agent" && !briefingDone && transcript.length > 1) briefingDone = true;
+          armSilenceTimer(); persist();
+        },
+      });
+    } catch (e) {
+      connecting = false; conv = null;
+      err.textContent = "Could not connect: " + (e?.message || e);
+      big.className = "armed"; big.textContent = "Listening"; status.textContent = "Waiting for you to speak";
+    }
+  }
+  function armSilenceTimer() {
+    clearTimeout(silenceTimer);
+    silenceTimer = setTimeout(async () => { if (conv) { try { await conv.endSession(); } catch (e) {} } }, SILENCE_HANGUP_MS);
+  }
+  function afterCall() {
+    clearTimeout(silenceTimer);
+    if (connectedAt) { connectedMs += Date.now() - connectedAt; connectedAt = 0; }
+    conv = null; connecting = false; persist(); showMinutes();
+    if (driving) { big.className = "armed"; big.textContent = "Listening"; status.textContent = "Off call. Speak to reconnect."; noiseFloor = Math.max(noiseFloor, 0.01); aboveSince = 0; }
+  }
+
+  // ---------- drive start / end ----------
+  async function startDrive() {
+    err.textContent = "";
+    if (AGENT_ID.startsWith("REPLACE")) { err.textContent = "Agent id not set yet."; return; }
+    driving = true; big.disabled = true;
+    try {
+      await keepAwake();
+      await startLocalListening();
+      big.className = "armed"; big.textContent = "Listening"; status.textContent = "Waiting for you to speak"; endBtn.hidden = false;
+      sub.textContent = "Free listening. Say \"hey\", wait for \"I'm here\", then talk. Quiet for 45 s hangs up; speaking reconnects.";
+    } catch (e) {
+      driving = false;
+      err.textContent = "Microphone not available: " + (e?.message || e) + ". If this is the home-screen icon, open the page in Safari or Chrome instead.";
+      big.className = ""; big.textContent = "Start drive";
+    } finally { big.disabled = false; }
+  }
+  async function endDrive() {
+    driving = false; clearTimeout(silenceTimer);
+    if (conv) { try { await conv.endSession(); } catch (e) {} }
+    afterCall();
+    if (rafId) cancelAnimationFrame(rafId);
+    try { if (wakeLock) { await wakeLock.release(); wakeLock = null; } } catch (e) {}
+    big.className = ""; big.textContent = "Start drive"; status.textContent = "Drive ended"; endBtn.hidden = true; level.style.width = "0";
+    sub.textContent = "Tap once before you pull out.";
+  }
+
+  big.addEventListener("click", () => { if (!driving) startDrive(); else if (!conv && !connecting) connect(); });
+  endBtn.addEventListener("click", endDrive);
+  showMinutes();
+</script>
+</body>
+</html>
