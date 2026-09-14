@@ -38,42 +38,42 @@
   <h1>Research colleague</h1>
   <button id="big">Start drive</button>
   <div id="status">Tap once before you pull out</div>
-  <div id="sub">Then just talk. Say "hey", wait for "I'm here", and go on. It hangs up after 45 seconds of quiet and reconnects when you speak.</div>
+  <div id="sub">Then just talk. Say "hey", wait for "I'm here", and go on. If the call ends during a pause, speak to reconnect.</div>
   <div id="meter"><div id="level"></div></div>
   <div id="minutes"></div>
-  <div id="row"><button class="small danger" id="end" hidden>End drive</button></div>
+  <div id="row"><button class="small" id="recover" hidden>Reconnect audio</button><button class="small danger" id="end" hidden>End drive</button></div>
+  <div id="device" aria-live="polite"></div>
   <div id="err"></div>
 
 <script type="module">
   import { Conversation } from "https://cdn.jsdelivr.net/npm/@elevenlabs/client@1.24.0/+esm";
 
   const AGENT_ID = "agent_2001m1smpwqnezr892jht4ezm88r";   // the setup script fills this in
-  const SILENCE_HANGUP_MS = 45000;             // matches the agent's silence_end_call_timeout
   const TRIGGER_RATIO = 3.2;                   // speech must exceed the noise floor by this factor
   const TRIGGER_HOLD_MS = 350;                 // ... for this long, to ignore bumps and clicks
-  const CONTEXT_CHARS = 1800;                  // how much of the recent transcript we hand back on reconnect
+  const CONTEXT_CHARS = 4000;                  // retain complete recent messages on reconnect
 
   const $ = id => document.getElementById(id);
-  const big = $("big"), status = $("status"), sub = $("sub"), err = $("err"), level = $("level"), endBtn = $("end"), minutesEl = $("minutes");
+  const big = $("big"), status = $("status"), sub = $("sub"), err = $("err"), level = $("level"), endBtn = $("end"), recoverBtn = $("recover"), minutesEl = $("minutes"), device = $("device");
 
-  let driving = false, conv = null, connecting = false, wakeLock = null;
+  let driving = false, conv = null, connecting = false, wakeLock = null, generation = 0, agentMode = "idle";
   let audioCtx = null, analyser = null, micStream = null, rafId = null;
-  let noiseFloor = 0.01, aboveSince = 0, lastSpeechAt = 0, silenceTimer = null;
-  let transcript = [], connectedMs = 0, connectedAt = 0, briefingDone = false, lastDispatchAt = 0, clockTimer = null;
+  let noiseFloor = 0.01, aboveSince = 0;
+  let transcript = [], connectedMs = 0, connectedAt = 0, briefingDone = false, lastDispatchAt = 0, pendingTasks = [], clockTimer = null;
 
   // ---------- persistence for the day (transcript + briefing flag) ----------
   const today = new Date().toISOString().slice(0, 10);
   try {
     const saved = JSON.parse(localStorage.getItem("commute-" + today) || "null");
-    if (saved) { transcript = saved.transcript || []; briefingDone = !!saved.briefingDone; connectedMs = saved.connectedMs || 0; }
+    if (saved) { transcript = saved.transcript || []; briefingDone = !!saved.briefingDone; connectedMs = saved.connectedMs || 0; lastDispatchAt = saved.lastDispatchAt || 0; pendingTasks = saved.pendingTasks || []; }
   } catch (e) {}
   function persist() {
-    try { localStorage.setItem("commute-" + today, JSON.stringify({ transcript: transcript.slice(-80), briefingDone, connectedMs })); } catch (e) {}
+    try { localStorage.setItem("commute-" + today, JSON.stringify({ transcript: transcript.slice(-80), briefingDone, connectedMs, lastDispatchAt, pendingTasks: pendingTasks.slice(-8) })); } catch (e) {}
   }
   function recentContext() {
     const lines = transcript.map(t => (t.role === "user" ? "Moshe: " : "You: ") + t.text);
     let out = lines.join("\n");
-    if (out.length > CONTEXT_CHARS) out = out.slice(-CONTEXT_CHARS);
+    while (out.length > CONTEXT_CHARS && lines.length > 1) { lines.shift(); out = lines.join("\n"); }
     return out || "(nothing yet this drive)";
   }
   function showMinutes() {
@@ -88,7 +88,9 @@
 
   // ---------- local voice detection (no minutes) ----------
   async function startLocalListening() {
+    if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
     if (!micStream) micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    if (!driving || conv || connecting) { if (micStream) { micStream.getTracks().forEach(track => track.stop()); micStream = null; } return; }
     if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     if (audioCtx.state === "suspended") await audioCtx.resume();
     if (!analyser) {
@@ -97,7 +99,7 @@
     }
     const buf = new Float32Array(analyser.fftSize);
     const tick = () => {
-      if (!driving) return;
+      if (!driving || conv || connecting || !analyser) return;
       analyser.getFloatTimeDomainData(buf);
       let sum = 0; for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
       const rms = Math.sqrt(sum / buf.length);
@@ -110,63 +112,80 @@
         if (ratio > TRIGGER_RATIO) { if (!aboveSince) aboveSince = now; if (now - aboveSince > TRIGGER_HOLD_MS) { aboveSince = 0; connect(); } }
         else aboveSince = 0;
       }
-      rafId = requestAnimationFrame(tick);
+      if (driving && !conv && !connecting && analyser) rafId = requestAnimationFrame(tick);
     };
     rafId = requestAnimationFrame(tick);
   }
+  async function stopLocalListening() {
+    if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+    aboveSince = 0;
+    if (micStream) { micStream.getTracks().forEach(track => track.stop()); micStream = null; }
+    analyser = null;
+    if (audioCtx) { try { await audioCtx.close(); } catch (e) {} audioCtx = null; }
+    level.style.width = "0";
+  }
 
   // ---------- the call ----------
+  function taskState() { return pendingTasks.length ? pendingTasks.map(t => new Date(t.acceptedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) + ": request=" + t.request + "; acknowledgment=" + t.summary).join(" | ") : "none"; }
+  function recordDiagnostic(text) { device.textContent = "Audio: " + text; }
+  function cleanup(expectedGeneration, reason) {
+    if (expectedGeneration !== generation) return null;
+    generation += 1; // callbacks for the prior session must no longer mutate this call
+    const ownedSession = conv;
+    clearInterval(clockTimer);
+    if (connectedAt) { connectedMs += Date.now() - connectedAt; connectedAt = 0; }
+    conv = null; connecting = false; agentMode = "idle"; persist(); showMinutes();
+    if (driving) { big.className = "armed"; big.textContent = "Listening"; status.textContent = reason || "Off call. Speak to reconnect."; recoverBtn.hidden = false; startLocalListening().catch(e => { recordDiagnostic("microphone recovery unavailable"); }); }
+    return ownedSession;
+  }
   async function connect() {
     if (conv || connecting || !driving) return;
-    connecting = true; err.textContent = "";
-    big.className = "connecting"; big.textContent = "…"; status.textContent = "Connecting";
+    const myGeneration = ++generation; connecting = true; err.textContent = ""; recoverBtn.hidden = true;
+    big.className = "connecting"; big.textContent = "..."; status.textContent = "Connecting";
     try {
-      conv = await Conversation.startSession({
+      await stopLocalListening(); // the SDK owns the active-call microphone; idle VAD must not double-capture it
+      if (myGeneration !== generation || !driving) return;
+      let session;
+      session = await Conversation.startSession({
         agentId: AGENT_ID,
-        dynamicVariables: { recent_context: recentContext(), briefing_done: briefingDone ? "yes" : "no", local_time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) },
-        onConnect: () => { connecting = false; connectedAt = Date.now(); big.className = "listening"; big.textContent = "On call"; status.textContent = "Connected"; armSilenceTimer(); },
-        onDisconnect: () => { afterCall(); },
-        onError: (e) => { err.textContent = String(e?.message || e); },
+        dynamicVariables: { recent_context: recentContext() + "\nClient-recorded task acknowledgments (not proof of current status): " + taskState(), briefing_done: briefingDone ? "yes" : "no", local_time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) },
+        onConnect: () => { if (myGeneration !== generation || !driving) return; connectedAt = Date.now(); agentMode = "listening"; recordDiagnostic("Call connected; output follows your device route"); big.className = "listening"; big.textContent = "On call"; status.textContent = "Connected"; },
+        onDisconnect: () => { cleanup(myGeneration); },
+        onError: (e) => { if (myGeneration !== generation || !driving) return; err.textContent = "Connection problem: " + String(e?.message || e); status.textContent = "Connection needs recovery"; recoverBtn.hidden = false; },
         onModeChange: ({ mode }) => {
+          if (myGeneration !== generation || !driving) return; agentMode = mode === "speaking" ? "speaking" : "listening";
           big.className = mode === "speaking" ? "speaking" : "listening";
           status.textContent = mode === "speaking" ? "Speaking" : "Listening";
-          if (mode === "speaking") armSilenceTimer();
         },
         onMessage: (m) => {
+          if (myGeneration !== generation || !driving) return;
           const role = (m.source === "user" || m.role === "user") ? "user" : "agent";
           const text = m.message || m.text || "";
           if (!text) return;
           transcript.push({ role, text, t: Date.now() });
           if (role === "agent" && !briefingDone && transcript.length > 1) briefingDone = true;
-          if (role === "agent" && /on its way|dispatched|sent it|sending it/i.test(text)) lastDispatchAt = Date.now();
-          armSilenceTimer(); persist();
+          if (role === "agent" && /on its way|dispatched|sent it|sending it|accepted/i.test(text)) { lastDispatchAt = Date.now(); const latestUser = [...transcript].reverse().find(item => item.role === "user"); pendingTasks.push({ summary: text.slice(0, 240), request: latestUser ? latestUser.text.slice(0, 360) : "not locally recorded", acceptedAt: lastDispatchAt }); }
+          persist();
         },
       });
+      if (myGeneration !== generation || !driving) { try { await session.endSession(); } catch (e) {} return; }
+      conv = session; connecting = false;
       // a clock for the agent: a background note every minute (does not interrupt, costs no turn)
       clearInterval(clockTimer);
       clockTimer = setInterval(() => {
-        if (!conv) return;
+        if (myGeneration !== generation || conv !== session) return;
         const since = lastDispatchAt ? Math.round((Date.now() - lastDispatchAt) / 60000) : null;
         const note = "Time note: it is " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) +
-          (since !== null ? ". Minutes since the last dispatch: " + since + "." : ". No dispatch yet this call.");
-        try { conv.sendContextualUpdate(note); } catch (e) {}
+          (since !== null ? ". Minutes since the last locally recorded dispatch: " + since + "." : ". No locally recorded dispatch time.");
+        try { session.sendContextualUpdate(note); } catch (e) {}
       }, 60000);
     } catch (e) {
-      connecting = false; conv = null;
+      if (myGeneration !== generation) return; cleanup(myGeneration, "Could not connect. Tap reconnect or speak.");
       err.textContent = "Could not connect: " + (e?.message || e);
       big.className = "armed"; big.textContent = "Listening"; status.textContent = "Waiting for you to speak";
     }
   }
-  function armSilenceTimer() {
-    clearTimeout(silenceTimer);
-    silenceTimer = setTimeout(async () => { if (conv) { try { await conv.endSession(); } catch (e) {} } }, SILENCE_HANGUP_MS);
-  }
-  function afterCall() {
-    clearTimeout(silenceTimer); clearInterval(clockTimer);
-    if (connectedAt) { connectedMs += Date.now() - connectedAt; connectedAt = 0; }
-    conv = null; connecting = false; persist(); showMinutes();
-    if (driving) { big.className = "armed"; big.textContent = "Listening"; status.textContent = "Off call. Speak to reconnect."; noiseFloor = Math.max(noiseFloor, 0.01); aboveSince = 0; }
-  }
+  // The server-side turn/end detector owns active-call silence. Local VAD is idle-only.
 
   // ---------- drive start / end ----------
   async function startDrive() {
@@ -174,10 +193,11 @@
     if (AGENT_ID.startsWith("REPLACE")) { err.textContent = "Agent id not set yet."; return; }
     driving = true; big.disabled = true;
     try {
-      await keepAwake();
-      await startLocalListening();
-      big.className = "armed"; big.textContent = "Listening"; status.textContent = "Waiting for you to speak"; endBtn.hidden = false;
-      sub.textContent = "Free listening. Say \"hey\", wait for \"I'm here\", then talk. Quiet for 45 s hangs up; speaking reconnects.";
+      void keepAwake();
+      endBtn.hidden = false;
+      await connect();
+      if (!driving) return;
+      sub.textContent = "Call minutes count while connected. After a call ends, local listening lets you speak to reconnect.";
     } catch (e) {
       driving = false;
       err.textContent = "Microphone not available: " + (e?.message || e) + ". If this is the home-screen icon, open the page in Safari or Chrome instead.";
@@ -185,16 +205,17 @@
     } finally { big.disabled = false; }
   }
   async function endDrive() {
-    driving = false; clearTimeout(silenceTimer);
-    if (conv) { try { await conv.endSession(); } catch (e) {} }
-    afterCall();
-    if (rafId) cancelAnimationFrame(rafId);
+    driving = false;
+    const ownedSession = cleanup(generation, "Drive ended");
+    if (ownedSession) { try { await ownedSession.endSession(); } catch (e) {} }
+    await stopLocalListening();
     try { if (wakeLock) { await wakeLock.release(); wakeLock = null; } } catch (e) {}
     big.className = ""; big.textContent = "Start drive"; status.textContent = "Drive ended"; endBtn.hidden = true; level.style.width = "0";
     sub.textContent = "Tap once before you pull out.";
   }
 
   big.addEventListener("click", () => { if (!driving) startDrive(); else if (!conv && !connecting) connect(); });
+  recoverBtn.addEventListener("click", async () => { const ownedSession = cleanup(generation, "Reconnecting audio"); if (ownedSession) { try { await ownedSession.endSession(); } catch (e) {} } if (driving) await connect(); });
   endBtn.addEventListener("click", endDrive);
   showMinutes();
 </script>
