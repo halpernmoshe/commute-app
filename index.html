@@ -57,7 +57,7 @@
   const big = $("big"), status = $("status"), sub = $("sub"), err = $("err"), level = $("level"), endBtn = $("end"), recoverBtn = $("recover"), minutesEl = $("minutes"), device = $("device");
 
   let driving = false, conv = null, connecting = false, wakeLock = null, generation = 0, agentMode = "idle";
-  let audioCtx = null, analyser = null, micStream = null, rafId = null;
+  let audioCtx = null, analyser = null, micStream = null, rafId = null, listeningGeneration = 0;
   let noiseFloor = 0.01, aboveSince = 0;
   let transcript = [], connectedMs = 0, connectedAt = 0, briefingDone = false, lastDispatchAt = 0, pendingTasks = [], clockTimer = null;
 
@@ -88,11 +88,20 @@
 
   // ---------- local voice detection (no minutes) ----------
   async function startLocalListening() {
+    const myListeningGeneration = ++listeningGeneration;
     if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
-    if (!micStream) micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    if (!micStream) {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+      // A newer recovery attempt or an active SDK call superseded this request while permission was pending.
+      if (myListeningGeneration !== listeningGeneration || !driving || conv || connecting) { stream.getTracks().forEach(track => track.stop()); return; }
+      micStream = stream;
+    }
+    if (myListeningGeneration !== listeningGeneration) return;
     if (!driving || conv || connecting) { if (micStream) { micStream.getTracks().forEach(track => track.stop()); micStream = null; } return; }
     if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    if (audioCtx.state === "suspended") await audioCtx.resume();
+    const idleContext = audioCtx;
+    if (idleContext.state === "suspended") await idleContext.resume();
+    if (myListeningGeneration !== listeningGeneration || !driving || conv || connecting || audioCtx !== idleContext) return;
     if (!analyser) {
       const src = audioCtx.createMediaStreamSource(micStream);
       analyser = audioCtx.createAnalyser(); analyser.fftSize = 1024; src.connect(analyser);
@@ -117,11 +126,13 @@
     rafId = requestAnimationFrame(tick);
   }
   async function stopLocalListening() {
+    listeningGeneration += 1; // invalidate any getUserMedia request still awaiting permission
     if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
     aboveSince = 0;
     if (micStream) { micStream.getTracks().forEach(track => track.stop()); micStream = null; }
     analyser = null;
-    if (audioCtx) { try { await audioCtx.close(); } catch (e) {} audioCtx = null; }
+    const idleContext = audioCtx; audioCtx = null;
+    if (idleContext) { try { await idleContext.close(); } catch (e) {} }
     level.style.width = "0";
   }
 
@@ -149,7 +160,7 @@
       session = await Conversation.startSession({
         agentId: AGENT_ID,
         dynamicVariables: { recent_context: recentContext() + "\nClient-recorded task acknowledgments (not proof of current status): " + taskState(), briefing_done: briefingDone ? "yes" : "no", local_time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) },
-        onConnect: () => { if (myGeneration !== generation || !driving) return; connectedAt = Date.now(); agentMode = "listening"; recordDiagnostic("Call connected; output follows your device route"); big.className = "listening"; big.textContent = "On call"; status.textContent = "Connected"; },
+        onConnect: () => { if (myGeneration !== generation || !driving) return; connectedAt = Date.now(); agentMode = "listening"; recoverBtn.hidden = false; recordDiagnostic("Call connected; output follows your device route"); big.className = "listening"; big.textContent = "On call"; status.textContent = "Connected"; },
         onDisconnect: () => { cleanup(myGeneration); },
         onError: (e) => { if (myGeneration !== generation || !driving) return; err.textContent = "Connection problem: " + String(e?.message || e); status.textContent = "Connection needs recovery"; recoverBtn.hidden = false; },
         onModeChange: ({ mode }) => {
