@@ -41,7 +41,7 @@
   <div id="sub">Then just talk. Say "hey", wait for "I'm here", and go on. If the call ends during a pause, speak to reconnect.</div>
   <div id="meter"><div id="level"></div></div>
   <div id="minutes"></div>
-  <div id="row"><button class="small" id="recover" hidden>Reconnect audio</button><button class="small danger" id="end" hidden>End drive</button></div>
+  <div id="row"><button class="small" id="recover" hidden>Reconnect audio</button><button class="small" id="exportDiagnostics">Export diagnostics</button><button class="small danger" id="end" hidden>End drive</button></div>
   <div id="device" aria-live="polite"></div>
   <div id="err"></div>
 
@@ -52,23 +52,32 @@
   const TRIGGER_RATIO = 3.2;                   // speech must exceed the noise floor by this factor
   const TRIGGER_HOLD_MS = 350;                 // ... for this long, to ignore bumps and clicks
   const CONTEXT_CHARS = 4000;                  // retain complete recent messages on reconnect
+  const RETRY_DELAYS_MS = [1500, 5000];        // bounded backend-error recovery
+  const APP_BUILD = "2026-09-15.1";
+  const DIAGNOSTIC_LIMIT = 200;
 
   const $ = id => document.getElementById(id);
-  const big = $("big"), status = $("status"), sub = $("sub"), err = $("err"), level = $("level"), endBtn = $("end"), recoverBtn = $("recover"), minutesEl = $("minutes"), device = $("device");
+  const big = $("big"), status = $("status"), sub = $("sub"), err = $("err"), level = $("level"), endBtn = $("end"), recoverBtn = $("recover"), exportBtn = $("exportDiagnostics"), minutesEl = $("minutes"), device = $("device");
 
   let driving = false, conv = null, connecting = false, wakeLock = null, generation = 0, agentMode = "idle";
   let audioCtx = null, analyser = null, micStream = null, rafId = null, listeningGeneration = 0;
   let noiseFloor = 0.01, aboveSince = 0;
-  let transcript = [], connectedMs = 0, connectedAt = 0, briefingDone = false, lastDispatchAt = 0, pendingTasks = [], clockTimer = null;
+  let transcript = [], connectedMs = 0, connectedAt = 0, briefingDone = false, lastDispatchAt = 0, pendingTasks = [], recentRequests = [], clockTimer = null;
+  let retryTimer = null, retryCount = 0, diagnostics = [], failureSpoken = false, automaticRecovery = false, sessionHadUser = false, currentConversationId = null;
 
   // ---------- persistence for the day (transcript + briefing flag) ----------
   const today = new Date().toISOString().slice(0, 10);
   try {
     const saved = JSON.parse(localStorage.getItem("commute-" + today) || "null");
-    if (saved) { transcript = saved.transcript || []; briefingDone = !!saved.briefingDone; connectedMs = saved.connectedMs || 0; lastDispatchAt = saved.lastDispatchAt || 0; pendingTasks = saved.pendingTasks || []; }
+    if (saved) {
+      transcript = saved.transcript || []; briefingDone = !!saved.briefingDone; connectedMs = saved.connectedMs || 0; lastDispatchAt = saved.lastDispatchAt || 0;
+      recentRequests = saved.recentRequests || [];
+      pendingTasks = (saved.pendingTasks || []).map(t => t.toolCallId ? t : ({ toolCallId: "legacy-" + (t.acceptedAt || Date.now()), request: t.request || "not locally recorded", toolName: "dispatch_task", state: "legacy acknowledgment only; worker completion unknown", updatedAt: t.acceptedAt || Date.now() })).slice(-8);
+    }
   } catch (e) {}
+  try { diagnostics = JSON.parse(localStorage.getItem("commute-diagnostics") || "[]").slice(-DIAGNOSTIC_LIMIT); localStorage.setItem("commute-diagnostics", JSON.stringify(diagnostics)); } catch (e) { diagnostics = []; }
   function persist() {
-    try { localStorage.setItem("commute-" + today, JSON.stringify({ transcript: transcript.slice(-80), briefingDone, connectedMs, lastDispatchAt, pendingTasks: pendingTasks.slice(-8) })); } catch (e) {}
+    try { localStorage.setItem("commute-" + today, JSON.stringify({ transcript: transcript.slice(-80), briefingDone, connectedMs, lastDispatchAt, pendingTasks: pendingTasks.slice(-8), recentRequests: recentRequests.slice(-8) })); } catch (e) {}
   }
   function recentContext() {
     const lines = transcript.map(t => (t.role === "user" ? "Moshe: " : "You: ") + t.text);
@@ -116,7 +125,7 @@
       noiseFloor = rms < noiseFloor ? noiseFloor * 0.98 + rms * 0.02 : noiseFloor * 0.999 + rms * 0.001;
       const ratio = rms / Math.max(noiseFloor, 0.002);
       level.style.width = Math.min(100, ratio * 20) + "%";
-      if (!conv && !connecting) {
+      if (!conv && !connecting && !automaticRecovery) {
         const now = performance.now();
         if (ratio > TRIGGER_RATIO) { if (!aboveSince) aboveSince = now; if (now - aboveSince > TRIGGER_HOLD_MS) { aboveSince = 0; connect(); } }
         else aboveSince = 0;
@@ -137,8 +146,33 @@
   }
 
   // ---------- the call ----------
-  function taskState() { return pendingTasks.length ? pendingTasks.map(t => new Date(t.acceptedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) + ": request=" + t.request + "; acknowledgment=" + t.summary).join(" | ") : "none"; }
+  function taskState() { return pendingTasks.length ? pendingTasks.map(t => new Date(t.updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) + ": request=" + t.request + "; tool=" + t.toolName + "; state=" + t.state).join(" | ") : "none"; }
+  function requestState() { return recentRequests.length ? recentRequests.map(r => new Date(r.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) + ": " + r.text).join(" | ") : "none"; }
   function recordDiagnostic(text) { device.textContent = "Audio: " + text; }
+  function safeFailureText(value) {
+    return String(value || "unknown error").replace(/(?:https?|wss?):\/\/\S+/gi, "[address removed]").replace(/([?&](?:token|key|authorization)=)[^&\s]+/gi, "$1[removed]").replace(/\b(bearer|token|api[-_ ]?key|authorization)\s*[:=]?\s+\S+/gi, "$1 [removed]").slice(0, 240);
+  }
+  function diagnostic(event, fields = {}) {
+    const entry = { timestampUtc: new Date().toISOString(), appBuild: APP_BUILD, event, conversationId: currentConversationId, retry: retryCount, online: navigator.onLine !== false, visibility: document.visibilityState || "unknown" };
+    for (const key of ["reason", "code", "errorClass", "toolCallId", "toolName", "toolStatus"]) if (fields[key] !== undefined && fields[key] !== null) entry[key] = typeof fields[key] === "number" ? fields[key] : safeFailureText(fields[key]);
+    diagnostics.push(entry); diagnostics = diagnostics.slice(-DIAGNOSTIC_LIMIT);
+    try { localStorage.setItem("commute-diagnostics", JSON.stringify(diagnostics)); } catch (e) {}
+  }
+  function explainFailure() {
+    if (failureSpoken || !("speechSynthesis" in window) || !("SpeechSynthesisUtterance" in window)) return;
+    failureSpoken = true;
+    try { window.speechSynthesis.speak(new window.SpeechSynthesisUtterance("Service interrupted. Retrying.")); } catch (e) {}
+  }
+  function cancelRetry() { if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; diagnostic("retry_cancelled"); } }
+  function scheduleRetry(expectedGeneration) {
+    if (!driving || retryCount >= RETRY_DELAYS_MS.length) { automaticRecovery = false; diagnostic("retry_exhausted"); status.textContent = "Service unavailable. Tap reconnect to try again."; return; }
+    automaticRecovery = true;
+    const delay = RETRY_DELAYS_MS[retryCount++];
+    diagnostic("retry_scheduled", { code: delay });
+    status.textContent = "Service interrupted. Reconnecting shortly…";
+    const timer = setTimeout(() => { clearTimeout(timer); retryTimer = null; if (driving && generation === expectedGeneration && !conv && !connecting) { diagnostic("retry_started"); connect(true); } }, delay);
+    retryTimer = timer;
+  }
   function cleanup(expectedGeneration, reason) {
     if (expectedGeneration !== generation) return null;
     generation += 1; // callbacks for the prior session must no longer mutate this call
@@ -146,12 +180,17 @@
     clearInterval(clockTimer);
     if (connectedAt) { connectedMs += Date.now() - connectedAt; connectedAt = 0; }
     conv = null; connecting = false; agentMode = "idle"; persist(); showMinutes();
-    if (driving) { big.className = "armed"; big.textContent = "Listening"; status.textContent = reason || "Off call. Speak to reconnect."; recoverBtn.hidden = false; startLocalListening().catch(e => { recordDiagnostic("microphone recovery unavailable"); }); }
+    if (driving) { big.className = "armed"; big.textContent = "Listening"; status.textContent = reason || "Off call. Speak to reconnect."; recoverBtn.hidden = false; if (!automaticRecovery) startLocalListening().catch(e => { recordDiagnostic("microphone recovery unavailable"); }); }
     return ownedSession;
   }
-  async function connect() {
+  async function connect(automatic = false) {
     if (conv || connecting || !driving) return;
+    cancelRetry();
+    if (!automatic) { retryCount = 0; failureSpoken = false; automaticRecovery = false; }
+    else { try { window.speechSynthesis?.cancel(); } catch (e) {} }
     const myGeneration = ++generation; connecting = true; err.textContent = ""; recoverBtn.hidden = true;
+    sessionHadUser = false;
+    diagnostic(automatic ? "automatic_connect_started" : "connect_started");
     big.className = "connecting"; big.textContent = "..."; status.textContent = "Connecting";
     try {
       await stopLocalListening(); // the SDK owns the active-call microphone; idle VAD must not double-capture it
@@ -159,10 +198,18 @@
       let session;
       session = await Conversation.startSession({
         agentId: AGENT_ID,
-        dynamicVariables: { recent_context: recentContext() + "\nClient-recorded task acknowledgments (not proof of current status): " + taskState(), briefing_done: briefingDone ? "yes" : "no", local_time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) },
-        onConnect: () => { if (myGeneration !== generation || !driving) return; connectedAt = Date.now(); agentMode = "listening"; recoverBtn.hidden = false; recordDiagnostic("Call connected; output follows your device route"); big.className = "listening"; big.textContent = "On call"; status.textContent = "Connected"; },
-        onDisconnect: () => { cleanup(myGeneration); },
-        onError: (e) => { if (myGeneration !== generation || !driving) return; err.textContent = "Connection problem: " + String(e?.message || e); status.textContent = "Connection needs recovery"; recoverBtn.hidden = false; },
+        dynamicVariables: { recent_context: recentContext() + "\nRecent user requests retained by the client; completion is unknown unless a structured tool result below says otherwise: " + requestState() + "\nStructured server tool results: " + taskState(), briefing_done: briefingDone ? "yes" : "no", local_time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) },
+        onConnect: ({ conversationId } = {}) => { if (myGeneration !== generation || !driving) return; currentConversationId = conversationId || currentConversationId; diagnostic("connected"); connectedAt = Date.now(); agentMode = "listening"; recoverBtn.hidden = false; recordDiagnostic("Call connected; output follows your device route"); big.className = "listening"; big.textContent = "On call"; status.textContent = "Connected"; },
+        onDisconnect: (details) => {
+          if (myGeneration !== generation || !driving) return;
+          const unexpected = details?.reason === "error";
+          diagnostic("disconnected", { reason: details?.message || details?.closeReason || details?.context?.reason || details?.reason, code: details?.closeCode || details?.context?.code, errorClass: details?.reason });
+          if (unexpected) { automaticRecovery = true; explainFailure(); }
+          const nextGeneration = generation + 1;
+          cleanup(myGeneration, unexpected ? "Service interrupted." : "Off call. Speak to reconnect.");
+          if (unexpected) scheduleRetry(nextGeneration);
+        },
+        onError: (message, context) => { if (myGeneration !== generation || !driving) return; diagnostic("sdk_error", { reason: message || context?.message, code: context?.code, errorClass: context?.name || context?.constructor?.name || "SDK error" }); err.textContent = "The research service reported a problem. Recovery is available."; status.textContent = "Connection needs recovery"; recoverBtn.hidden = false; },
         onModeChange: ({ mode }) => {
           if (myGeneration !== generation || !driving) return; agentMode = mode === "speaking" ? "speaking" : "listening";
           big.className = mode === "speaking" ? "speaking" : "listening";
@@ -174,13 +221,27 @@
           const text = m.message || m.text || "";
           if (!text) return;
           transcript.push({ role, text, t: Date.now() });
+          if (role === "user") { sessionHadUser = true; recentRequests.push({ text: text.slice(0, 500), at: Date.now() }); recentRequests = recentRequests.slice(-8); }
           if (role === "agent" && !briefingDone && transcript.length > 1) briefingDone = true;
-          if (role === "agent" && /on its way|dispatched|sent it|sending it|accepted/i.test(text)) { lastDispatchAt = Date.now(); const latestUser = [...transcript].reverse().find(item => item.role === "user"); pendingTasks.push({ summary: text.slice(0, 240), request: latestUser ? latestUser.text.slice(0, 360) : "not locally recorded", acceptedAt: lastDispatchAt }); }
+          if (role === "agent" && sessionHadUser && !/^\s*(i['’]?m here[.!]?|hello[.!]?|hi[.!]?)\s*$/i.test(text)) { retryCount = 0; failureSpoken = false; automaticRecovery = false; }
           persist();
+        },
+        onAgentToolResponse: (result) => {
+          if (myGeneration !== generation || !driving || !result?.tool_call_id) return;
+          diagnostic("tool_response", { toolCallId: result.tool_call_id, toolName: result.tool_name, toolStatus: result.is_error ? "error" : (result.is_called ? "called" : "not called") });
+          if (result.tool_name !== "dispatch_task") return;
+          const latestRequest = recentRequests[recentRequests.length - 1];
+          const state = result.is_error ? "dispatch webhook failed; worker completion unknown" : (result.is_called ? "dispatch webhook succeeded; worker completion unknown" : "dispatch was not called");
+          const existing = pendingTasks.find(t => t.toolCallId === result.tool_call_id);
+          const entry = existing || { toolCallId: result.tool_call_id, request: latestRequest?.text || "not locally recorded" };
+          Object.assign(entry, { toolName: String(result.tool_name || "unknown").slice(0, 120), state, updatedAt: Date.now() });
+          if (!existing) pendingTasks.push(entry);
+          pendingTasks = pendingTasks.slice(-8); lastDispatchAt = entry.updatedAt; persist();
         },
       });
       if (myGeneration !== generation || !driving) { try { await session.endSession(); } catch (e) {} return; }
       conv = session; connecting = false;
+      try { currentConversationId = session.getId() || currentConversationId; diagnostic("session_id_confirmed"); } catch (e) {}
       // a clock for the agent: a background note every minute (does not interrupt, costs no turn)
       clearInterval(clockTimer);
       clockTimer = setInterval(() => {
@@ -191,7 +252,7 @@
         try { session.sendContextualUpdate(note); } catch (e) {}
       }, 60000);
     } catch (e) {
-      if (myGeneration !== generation) return; cleanup(myGeneration, "Could not connect. Tap reconnect or speak.");
+      if (myGeneration !== generation) return; diagnostic("connect_failed", { reason: e?.message || e, errorClass: e?.name || e?.constructor?.name }); cleanup(myGeneration, "Could not connect. Tap reconnect or speak.");
       err.textContent = "Could not connect: " + (e?.message || e);
       big.className = "armed"; big.textContent = "Listening"; status.textContent = "Waiting for you to speak";
     }
@@ -202,7 +263,7 @@
   async function startDrive() {
     err.textContent = "";
     if (AGENT_ID.startsWith("REPLACE")) { err.textContent = "Agent id not set yet."; return; }
-    driving = true; big.disabled = true;
+    driving = true; big.disabled = true; exportBtn.hidden = true;
     try {
       void keepAwake();
       endBtn.hidden = false;
@@ -216,18 +277,25 @@
     } finally { big.disabled = false; }
   }
   async function endDrive() {
-    driving = false;
+    driving = false; cancelRetry(); automaticRecovery = false; try { window.speechSynthesis?.cancel(); } catch (e) {}
     const ownedSession = cleanup(generation, "Drive ended");
     if (ownedSession) { try { await ownedSession.endSession(); } catch (e) {} }
     await stopLocalListening();
     try { if (wakeLock) { await wakeLock.release(); wakeLock = null; } } catch (e) {}
     big.className = ""; big.textContent = "Start drive"; status.textContent = "Drive ended"; endBtn.hidden = true; level.style.width = "0";
-    sub.textContent = "Tap once before you pull out.";
+    sub.textContent = "Tap once before you pull out."; exportBtn.hidden = false; currentConversationId = null;
+  }
+
+  function exportDiagnostics() {
+    if (driving) return;
+    const blob = new Blob([JSON.stringify({ appBuild: APP_BUILD, exportedAtUtc: new Date().toISOString(), events: diagnostics }, null, 2)], { type: "application/json" });
+    const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = "commute-diagnostics-" + today + ".json"; link.click(); URL.revokeObjectURL(link.href);
   }
 
   big.addEventListener("click", () => { if (!driving) startDrive(); else if (!conv && !connecting) connect(); });
   recoverBtn.addEventListener("click", async () => { const ownedSession = cleanup(generation, "Reconnecting audio"); if (ownedSession) { try { await ownedSession.endSession(); } catch (e) {} } if (driving) await connect(); });
   endBtn.addEventListener("click", endDrive);
+  exportBtn.addEventListener("click", exportDiagnostics);
   showMinutes();
 </script>
 </body>
